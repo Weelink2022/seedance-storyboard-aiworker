@@ -502,14 +502,6 @@ class StandaloneRunner:
         )
         self.project.write_text(output_path, fm + strip_frontmatter(current).lstrip())
 
-        # §45 (2026-05-20):抽 LLM 输出里的 ```json``` 代码块,拼成结构化 director.json。
-        #   目的:让下游 split_all_ps 直接 json_decode,不再正则解析 markdown(标题级别
-        #   ## / ### 这种 LLM 自由发挥的格式)。抽取失败不阻断,下游会回退到 §44 锚点解析。
-        try:
-            self._write_director_json(episode, current)
-        except Exception as e:
-            print(f"[§45] 抽 director JSON 失败(不阻断主流程): {e}")
-
         print(f"导演分析已完成并写入: {output_path}")
         for review in reviews:
             print(f"- {review.name}: {'PASS' if review.passed else 'FAIL'}")
@@ -828,63 +820,6 @@ class StandaloneRunner:
             ],
             prompt,
         ).strip()
-
-    def _write_director_json(self, episode: str, director_md: str) -> None:
-        """§45 (2026-05-20):从 LLM 产出的 director markdown 里抽 ```json``` 代码块,
-        拼成结构化 01-director-analysis.json,与 .md 并存。
-
-        约定(由 SKILL.md §45 段强制):
-        - 每个 ## P0X 段末尾紧跟一个 ```json``` 块,内含该 P 的元数据 + shots[]
-        - 文末一个含 _global 顶层键的 ```json``` 块,含全局 characters[] / scenes[]
-
-        抽取 / 解析 / 写入失败 → 不阻断主流程,只打印警告。
-        下游 split_all_ps 优先读 .json,失败回退 §44 锚点解析 .md。
-        """
-        import re as _re
-        import json as _json
-
-        json_dir = self.project.output_dir_for(episode)
-        json_path = json_dir / "01-director-analysis.json"
-
-        # 抽所有 ```json``` 块(允许无 json 标签的纯 ``` 块兜底)
-        blocks = _re.findall(r'```(?:json)?\s*\n([\s\S]+?)\n```', director_md)
-        if not blocks:
-            print(f"[§45] LLM 未输出 ```json``` 块 — 跳过 director.json")
-            return
-
-        p_segments = []
-        global_obj = {}
-        bad = 0
-        for blk in blocks:
-            try:
-                j = _json.loads(blk)
-            except Exception:
-                bad += 1
-                continue
-            if isinstance(j, dict) and isinstance(j.get('_global'), dict):
-                global_obj = j['_global']
-            elif isinstance(j, dict) and isinstance(j.get('code', ''), str) and _re.match(r'^P\d+$', j.get('code', '')):
-                p_segments.append(j)
-
-        if not p_segments:
-            print(f"[§45] 抽到 {len(blocks)} 个 JSON 块但无 P 段(bad={bad}) — 跳过 director.json")
-            return
-
-        out = {
-            'p_segments': p_segments,
-            'characters': global_obj.get('characters', []),
-            'scenes':     global_obj.get('scenes', []),
-            '_meta': {
-                'source': 'seedance.py §45 md+JSON 双轨抽取',
-                'episode': episode,
-                'json_blocks_total': len(blocks),
-                'p_segments_parsed': len(p_segments),
-                'json_parse_failed': bad,
-            },
-        }
-        json_path.write_text(_json.dumps(out, ensure_ascii=False, indent=2), encoding="utf-8")
-        print(f"[§45] director.json 已写入 ({len(p_segments)} P 段, "
-              f"{len(out['characters'])} chars, {len(out['scenes'])} scenes): {json_path}")
 
     def _generate_art_design(self, episode: str, director_output: Path) -> tuple[str, str, str]:
         """§38: 增 PROP_PROMPTS 第三块。返回 (character, scene, prop)。

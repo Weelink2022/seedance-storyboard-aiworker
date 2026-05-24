@@ -3,8 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import datetime
-import hashlib
 import json
 import os
 import re
@@ -19,62 +17,10 @@ from urllib import error, request
 EPISODE_PATTERN = re.compile(r"(ep\d{2})", re.IGNORECASE)
 BUSINESS_PASS_PATTERN = re.compile(r"业务审核：\s*PASS")
 COMPLIANCE_PASS_PATTERN = re.compile(r"合规审核：\s*PASS")
-# §38 (2026-05-13): art-designer 输出从 2 块 (character+scene) 升级到 3 块 (+prop)
 SECTION_PATTERN = re.compile(
-    # 2026-05-10 §23.7: 边界标记容错 2-4 个 ">"。
-    # DeepSeek 实测会输出 "<<<CHARACTER_PROMPTS>>"（仅 2 个 >），Gemini/豆包 是 3 个 >。
-    # §38: PROP_PROMPTS 块可选(老 LLM 输出可能缺，缺时 prop_content=''，不报错)
-    r"<<<CHARACTER_PROMPTS>{2,4}\s*(.*?)\s*<<<SCENE_PROMPTS>{2,4}\s*(.*?)"
-    r"(?:\s*<<<PROP_PROMPTS>{2,4}\s*(.*))?\Z",
+    r"<<<CHARACTER_PROMPTS>>>\s*(.*?)\s*<<<SCENE_PROMPTS>>>\s*(.*)",
     re.DOTALL,
 )
-
-
-# §38 (2026-05-13): 产物 schema 版本表。SKILL/template 升级 → 把对应 version 加 1
-# stage_is_current() 看 frontmatter.schema_version < 这里的值就触发重跑。
-SCHEMA_VERSIONS = {
-    "director":  1,  # outputs/<ep>/01-director-analysis.md
-    "character": 2,  # assets/character-prompts.md (§36 加音色垫词后是 2)
-    "scene":     1,  # assets/scene-prompts.md
-    "prop":      1,  # assets/prop-prompts.md (§37 新增)
-    "storyboard":1,  # outputs/<ep>/02-seedance-prompts.md
-}
-
-
-def compute_skill_hash(*paths: Path) -> str:
-    """sha1(concat of file contents). 跳过不存在的文件。"""
-    h = hashlib.sha1()
-    for p in paths:
-        if p.is_file():
-            h.update(p.read_bytes())
-        elif p.is_dir():
-            for f in sorted(p.rglob("*.md")):
-                h.update(f.read_bytes())
-    return h.hexdigest()[:16]
-
-
-def render_frontmatter(*, schema_version: int, skill_hash: str, stage: str, episode: str) -> str:
-    """§38: 产物 md 顶部 YAML frontmatter。"""
-    ts = datetime.datetime.now(datetime.timezone.utc).astimezone().isoformat(timespec="seconds")
-    return (
-        "---\n"
-        f"schema_version: {schema_version}\n"
-        f"skill_hash: {skill_hash}\n"
-        f"generated_at: {ts}\n"
-        f"generator: seedance.py\n"
-        f"stage: {stage}\n"
-        f"episode: {episode}\n"
-        "---\n\n"
-    )
-
-
-def strip_frontmatter(content: str) -> str:
-    """剥除 frontmatter (--- ... --- 头部)，返回正文。无 frontmatter 时原样返回。"""
-    if content.startswith("---\n"):
-        end = content.find("\n---\n", 4)
-        if end > 0:
-            return content[end + 5:].lstrip()
-    return content
 
 AGENT_FILE_MAP = {
     "director": "agents/director.md",
@@ -250,10 +196,6 @@ class SeedanceProject:
     def scene_prompts_path(self) -> Path:
         return self.assets_dir / "scene-prompts.md"
 
-    @property
-    def prop_prompts_path(self) -> Path:  # §38 (§37 落地最后一公里)
-        return self.assets_dir / "prop-prompts.md"
-
 
 def choose_current_episode(statuses: Iterable[EpisodeStatus]) -> EpisodeStatus | None:
     ordered = list(statuses)
@@ -422,9 +364,6 @@ class GeminiGatewayClient:
             "model": model or self.config.default_model,
             "messages": list(messages),
             "temperature": temperature,
-            # §38.4 (2026-05-13): 把 max_tokens 拉到模型上限附近，防止 art-designer 输出 7+
-            # 道具时被截断。DeepSeek/Gemini 都支持 8192-16384。
-            "max_tokens": 16384,
         }
         data = json.dumps(payload).encode("utf-8")
         http_request = request.Request(
@@ -494,21 +433,7 @@ class StandaloneRunner:
             medium_value,
             max_review_rounds=max_review_rounds,
         )
-        # §38: 加 frontmatter
-        skill_hash = compute_skill_hash(self.project.root / "skills" / "director-skill")
-        fm = render_frontmatter(
-            schema_version=SCHEMA_VERSIONS["director"],
-            skill_hash=skill_hash, stage="director", episode=episode,
-        )
-        self.project.write_text(output_path, fm + strip_frontmatter(current).lstrip())
-
-        # §45 (2026-05-20):抽 LLM 输出里的 ```json``` 代码块,拼成结构化 director.json。
-        #   目的:让下游 split_all_ps 直接 json_decode,不再正则解析 markdown(标题级别
-        #   ## / ### 这种 LLM 自由发挥的格式)。抽取失败不阻断,下游会回退到 §44 锚点解析。
-        try:
-            self._write_director_json(episode, current)
-        except Exception as e:
-            print(f"[§45] 抽 director JSON 失败(不阻断主流程): {e}")
+        self.project.write_text(output_path, current)
 
         print(f"导演分析已完成并写入: {output_path}")
         for review in reviews:
@@ -536,55 +461,29 @@ class StandaloneRunner:
                 f"检测到 {episode} 的服化道内容已写入 assets。使用 --force 才会重新生成。"
             )
 
-        character_content, scene_content, prop_content = self._generate_art_design(episode, director_output)
-        character_content, scene_content, prop_content, reviews = self._review_and_revise_art_design(
+        character_content, scene_content = self._generate_art_design(episode, director_output)
+        character_content, scene_content, reviews = self._review_and_revise_art_design(
             episode,
             director_output,
             character_content,
             scene_content,
-            prop_content,
             max_review_rounds=max_review_rounds,
-        )
-        # §38: 加 frontmatter 头
-        skill_hash = compute_skill_hash(
-            self.project.root / "skills" / "art-design-skill",
         )
         self._write_asset_content(
             self.project.character_prompts_path,
             "人物提示词",
             character_content,
             replace_episode=episode if force else None,
-            stage="character",
-            episode=episode,
-            skill_hash=skill_hash,
         )
-        # B3 (2026-05-15): 不再强拆场景合集。LLM 写合集 / 写独立场景都可以,
-        #   publish 阶段(one_click_film.php parse_scene_md)统一按 panel 粒度建
-        #   N 个独立 scene 实体,每个场景单独出图。撤掉原 T2 强拆。
         self._write_asset_content(
             self.project.scene_prompts_path,
             "场景道具提示词",
             scene_content,
             replace_episode=episode if force else None,
-            stage="scene",
-            episode=episode,
-            skill_hash=skill_hash,
         )
-        if prop_content:  # §38: prop 块只在有内容时写（LLM 可能本集无新增道具）
-            self._write_asset_content(
-                self.project.prop_prompts_path,
-                "道具提示词",
-                prop_content,
-                replace_episode=episode if force else None,
-                stage="prop",
-                episode=episode,
-                skill_hash=skill_hash,
-            )
 
         print(f"服化道设计已完成并写入: {self.project.character_prompts_path}")
         print(f"服化道设计已完成并写入: {self.project.scene_prompts_path}")
-        if prop_content:
-            print(f"服化道设计已完成并写入: {self.project.prop_prompts_path}")
         for review in reviews:
             print(f"- {review.name}: {'PASS' if review.passed else 'FAIL'}")
         return 0
@@ -616,13 +515,7 @@ class StandaloneRunner:
             current,
             max_review_rounds=max_review_rounds,
         )
-        # §38: 加 frontmatter
-        sb_skill_hash = compute_skill_hash(self.project.root / "skills" / "seedance-storyboard-skill")
-        fm = render_frontmatter(
-            schema_version=SCHEMA_VERSIONS["storyboard"],
-            skill_hash=sb_skill_hash, stage="storyboard", episode=episode,
-        )
-        self.project.write_text(prompt_output, fm + strip_frontmatter(current).lstrip())
+        self.project.write_text(prompt_output, current)
 
         print(f"Seedance 提示词已完成并写入: {prompt_output}")
         for review in reviews:
@@ -636,80 +529,15 @@ class StandaloneRunner:
         style: str,
         medium: str,
     ) -> str:
-        # §38.2 (2026-05-13): 显式列出必须输出的章节，不让 LLM 偷懒漏写音色/道具
-        # 原问题：SKILL.md 里写"第六步音色清单 第七步道具清单"但 DeepSeek 容易跳过这两段。
-        # 修法：prompt 顶部直接列出五个章节标题，明确"少一段视为不合格"。
         prompt = "\n\n".join(
             [
                 f"任务: 为 {episode} 生成完整的 outputs/{episode}/01-director-analysis.md。",
                 "你必须只输出最终 markdown 文件内容，不要解释，不要加代码块。",
-                "",
-                "## 必含章节清单（缺一不可，按此顺序）",
-                "1. `## 视觉风格说明` — 整体风格 / 色彩基调 / 材质质感 / 光影方向（director-skill 第一步）",
-                "2. `## 导演讲戏本` 及其下若干 `## P0X 剧情标题` — 每个剧情点都要含运镜/动作/台词/光影 4 要素（director-skill 第二~四步）",
-                "3. `## 人物清单` — markdown 表格：人物名 / 性别年龄 / 外观关键词 / 素材状态（director-skill 第五步）",
-                "4. **`## 音色清单（§36）` — 必须存在！** markdown 表格：人物名 / 音色垫词（60-100 字综合 8 维度的叙事描述）/ 素材状态。与人物清单严格一一对应。详见 director-skill SKILL.md 第六步。",
-                "5. **`## 道具清单（§37）` — 必须存在，且必须真正扫描剧本！** 详见后面「道具清单填充规则」。",
-                "6. `## 场景清单` — markdown 表格：场景名 / 时间 / 光线色调 / 角色着装要求 / 素材状态（director-skill 第八步）",
-                "",
-                "## 道具清单填充规则（§38.3 强化）",
-                "**扫剧本的方式**: 用以下关键词逐行扫描整本剧本——",
-                "- 医疗类：体检报告 / 化验单 / 处方 / 药 / CGM / 血糖仪 / 监测器 / 听诊器 / 注射器 / 病历",
-                "- 电子类：手机 / 电脑 / 平板 / 屏幕显示的关键信息 / 智能手表 / 视频通话画面",
-                "- 文件类：信件 / 合同 / 研究报告 / 笔记本 / 单据 / 文件夹",
-                "- 配饰类：眼镜 / 项链 / 戒指 / 钥匙 / 钱包 / 徽章",
-                "- 武器/工具类：刀 / 枪 / 工具 / 仪器",
-                "- 食物/餐具：特定品牌饮品 / 标志性食物 / 餐盘",
-                "**列入清单的判定**（满足任一即列入，宁多勿少）：",
-                "- 该物品在剧本中**出现 2 次或以上**（任何形式：被人持/特写/对话提到）",
-                "- 该物品在**首尾呼应**中出现（如开头王阿姨愁容看血糖仪、结尾健康血糖数值）",
-                "- 该物品是**剧情转折触发点**（如体检报告掉落引发觉醒）",
-                "- 该物品是**人物关系象征**（如导师推过来的研究报告、母亲的旧手机）",
-                "- 该物品**画面突出**（特写镜头 / 反复出现的视觉锚点）",
-                "**不列入的情形**：街景里的随意物件、餐桌上的普通餐具、办公桌上一般文件等氛围道具。",
-                "**特别提醒**：",
-                "- 不要因为道具是「普通物品」就跳过——CGM 在科技剧情里是关键道具，血糖仪在健康剧情里是关键道具",
-                "- 只有当你**真正扫描完整本剧本、确认没有任何满足上述条件的物品**时，才填占位行：`| (本集无新增叙事关键道具) | - | - | - |`",
-                "- 宁可多列 1 个候选道具，服化道下游会判断是否真的设计参考图",
-                "",
-                "## 输出合规自检",
-                "- 输出前自行 grep 一遍，确保 5 个 `## ` 标题都在",
-                "- **音色清单与道具清单是 §36/§37 后必须的章节，绝对不要省略**",
-                "- 群演/一次性配角不进人物清单和音色清单；零散背景物件不进道具清单",
-                "- 道具清单若只有占位行，自问一遍：'剧本里真的没有任何 CGM / 报告 / 信件 / 手机 / 眼镜 / 药 / 监测器 / 关键物品吗？' 答 yes 才填占位",
-                "",
-                '## 台词书写规则（§38.9 强制，与下游音色拼接配套）',
-                '在每个 `## P0X 剧情标题` 的导演阐述里写台词时，**必须显式标注说话者姓名，禁止用代词**：',
-                '- ✗ 错：`她笑着说：「小林，你看！」` （「她」是代词，下游无法判断谁说的）',
-                '- ✗ 错：`他对着镜头说：「...」` （「他」是代词）',
-                '- ✓ 对：`王阿姨笑着说：「小林，你看！」` （说话者姓名紧贴台词）',
-                '- ✓ 对：`林远对着镜头说：「...」` （说话者姓名紧贴台词）',
-                '**规则**：每一句带引号的台词前 20 字符内必须出现说话角色的姓名（不能用「他/她/它/他们/她们」等代词）。',
-                '**原因**：下游识别绑定智能推荐要按「角色名→引号」的相邻关系拼音色垫词，代词会让 TTS 把音色拼错。',
-                "",
-                "",
-                "## §39 结构化分镜参考（前期镜头规划蓝图）",
-                "下方「结构化分镜数据」是 smart_analysis 预先对本剧本做的前期镜头规划",
-                "（场景/人物/分镜的字段化清单）。它是你说戏的**参考蓝图**，用法：",
-                "- 场景清单、人物名单可参考它核对，省去从零识别；",
-                "- 但人物设定细节、音色垫词、道具叙事权重，仍须你**通读剧本原文**得出——",
-                "  结构化分镜只有画面事实，没有叙事潜台词和音色依据；",
-                "- 剧情点划分、时长可在其基础上按叙事需要调整（Seedance 单条 4-15 秒上限不变）；",
-                "- **强制：每个 `## P0X` 剧情点的元数据里必须加一行 `- 包含分镜：S1,S2,S3`**，",
-                "  列出本剧情点由「结构化分镜数据」里哪几个镜号组成（用其 shot_no，逗号分隔）。",
-                "  一个 P 通常归并 1-4 个相邻 S。**不重不漏硬约束**：每个镜号只能",
-                "  出现在一个 P，严禁两个 P 重复声明同一镜号；全部镜号必须被覆盖一个不漏；",
-                "  输出前自检所有「包含分镜」行的镜号无重复、无遗漏。",
-                "- 只标映射，不受 S 描述措辞限制：S 仅是镜头划分参考坐标，导演阐述仍按剧本原文自由创作；",
-                "- 若该 block 为「(无)」，照常仅依据剧本原文说戏，可省略「包含分镜」行。",
-                "",
                 f"视觉风格: {style}",
                 f"目标媒介: {medium}",
                 self._labeled_block("剧本文件", self.project.read_text(script_path)),
-                self._optional_block("结构化分镜数据", self._smart_analyze_digest()),
-                self._optional_block("已有人物提示词", strip_frontmatter(self.project.read_text(self.project.character_prompts_path))),
-                self._optional_block("已有场景提示词", strip_frontmatter(self.project.read_text(self.project.scene_prompts_path))),
-                self._optional_block("已有道具提示词", strip_frontmatter(self.project.read_text(self.project.prop_prompts_path))),
+                self._optional_block("已有人物提示词", self.project.read_text(self.project.character_prompts_path)),
+                self._optional_block("已有场景提示词", self.project.read_text(self.project.scene_prompts_path)),
             ]
         )
         return self._call_agent(
@@ -797,21 +625,11 @@ class StandaloneRunner:
         medium: str,
         reviews: Sequence[ReviewResult],
     ) -> str:
-        # §38.2: 修订路径也要重申五大章节，防止 LLM 在修订时把音色/道具又"忘"了
         feedback = "\n\n".join(f"[{review.name}]\n{review.text}" for review in reviews)
         prompt = "\n\n".join(
             [
                 f"根据以下全部审核意见，一次性修订 {episode} 的 01-director-analysis.md。",
                 "你必须只输出修订后的完整 markdown 文件内容，不要解释，不要加代码块。",
-                "",
-                "## 必含章节清单（缺一不可，按此顺序）",
-                "1. `## 视觉风格说明`",
-                "2. `## 导演讲戏本` 及若干 `## P0X` 剧情点",
-                "3. `## 人物清单`",
-                "4. **`## 音色清单（§36）`** — 必须存在，与人物清单一一对应",
-                "5. **`## 道具清单（§37）`** — 必须真正扫剧本！医疗器械(CGM/血糖仪/报告)/电子产品/文件/配饰/工具等只要出现 2 次以上或为剧情转折触发点都要列入。宁多勿少，只有真扫完确认无物才填占位行。",
-                "6. `## 场景清单`",
-                "",
                 f"视觉风格: {style}",
                 f"目标媒介: {medium}",
                 self._labeled_block("原始剧本", self.project.read_text(script_path)),
@@ -829,98 +647,16 @@ class StandaloneRunner:
             prompt,
         ).strip()
 
-    def _write_director_json(self, episode: str, director_md: str) -> None:
-        """§45 (2026-05-20):从 LLM 产出的 director markdown 里抽 ```json``` 代码块,
-        拼成结构化 01-director-analysis.json,与 .md 并存。
-
-        约定(由 SKILL.md §45 段强制):
-        - 每个 ## P0X 段末尾紧跟一个 ```json``` 块,内含该 P 的元数据 + shots[]
-        - 文末一个含 _global 顶层键的 ```json``` 块,含全局 characters[] / scenes[]
-
-        抽取 / 解析 / 写入失败 → 不阻断主流程,只打印警告。
-        下游 split_all_ps 优先读 .json,失败回退 §44 锚点解析 .md。
-        """
-        import re as _re
-        import json as _json
-
-        json_dir = self.project.output_dir_for(episode)
-        json_path = json_dir / "01-director-analysis.json"
-
-        # 抽所有 ```json``` 块(允许无 json 标签的纯 ``` 块兜底)
-        blocks = _re.findall(r'```(?:json)?\s*\n([\s\S]+?)\n```', director_md)
-        if not blocks:
-            print(f"[§45] LLM 未输出 ```json``` 块 — 跳过 director.json")
-            return
-
-        p_segments = []
-        global_obj = {}
-        bad = 0
-        for blk in blocks:
-            try:
-                j = _json.loads(blk)
-            except Exception:
-                bad += 1
-                continue
-            if isinstance(j, dict) and isinstance(j.get('_global'), dict):
-                global_obj = j['_global']
-            elif isinstance(j, dict) and isinstance(j.get('code', ''), str) and _re.match(r'^P\d+$', j.get('code', '')):
-                p_segments.append(j)
-
-        if not p_segments:
-            print(f"[§45] 抽到 {len(blocks)} 个 JSON 块但无 P 段(bad={bad}) — 跳过 director.json")
-            return
-
-        out = {
-            'p_segments': p_segments,
-            'characters': global_obj.get('characters', []),
-            'scenes':     global_obj.get('scenes', []),
-            '_meta': {
-                'source': 'seedance.py §45 md+JSON 双轨抽取',
-                'episode': episode,
-                'json_blocks_total': len(blocks),
-                'p_segments_parsed': len(p_segments),
-                'json_parse_failed': bad,
-            },
-        }
-        json_path.write_text(_json.dumps(out, ensure_ascii=False, indent=2), encoding="utf-8")
-        print(f"[§45] director.json 已写入 ({len(p_segments)} P 段, "
-              f"{len(out['characters'])} chars, {len(out['scenes'])} scenes): {json_path}")
-
-    def _generate_art_design(self, episode: str, director_output: Path) -> tuple[str, str, str]:
-        """§38: 增 PROP_PROMPTS 第三块。返回 (character, scene, prop)。
-        §38.2: 强化 prompt — 明确要求基于导演产物的清单逐项产出，含音色垫词原样照抄。"""
+    def _generate_art_design(self, episode: str, director_output: Path) -> tuple[str, str]:
         prompt = "\n\n".join(
             [
-                f"任务: 为 {episode} 生成本集新增的服化道内容（人物提示词 / 场景提示词 / 道具提示词）。",
-                "",
-"## 输入来源",
-                "- 上方「导演分析」块里有：人物清单 / 音色清单 / 道具清单 / 场景清单",
-                "- 为每个标「新增」或「变体」的人物/场景/道具产出提示词",
-                "- 标「复用」的项跳过",
-                "",
-                "## 强制要求",
-                "1. **音色垫词**：character-prompts.md 每个人物段落必须含 `**音色垫词**:` 副段，**从导演分析的 ## 音色清单中原样照抄**，不改写、不润色。",
-                "2. **道具变体**：道具有变体时（如手机裂屏），基础版 + 每个变体各一段提示词，标注触发剧情点。",
-                '3. **场景写法（强制，与 art-direction-review-skill 审核规范一致）**：',
-                '   - 场景提示词**必须**采用「全集场景合集宫格」格式：把本集所有场景'
-                '整合进**一张** 3×3 宫格(≤9 场景)/3×4(10-12)/4×4(13-16)。',
-                '   - 输出**只能有一个** `## ` 二级标题(如 `## ep01 场景合集（3×3 九宫格）`)。',
-                '   - 标题下用 `格1——【场景名】场景描述` 逐格列出, 格1=场景1, 格2=场景2 …, 余格留空。',
-                '   - **禁止**为每个场景单独写 `## 场景名` 段落 — 审核会判 FAIL。',
-                '   - 段首写「### 视觉规范」描述全集统一风格(色调/材质/光影)。',
-                "",
-                "## 输出格式（严格三块，缺一不可）",
-                "<<<CHARACTER_PROMPTS>>>",
-                "[追加到 assets/character-prompts.md 的内容，不重复文件标题；每个人物含视觉提示词 + **音色垫词**副段]",
-                "<<<SCENE_PROMPTS>>>",
-                "[追加到 assets/scene-prompts.md 的内容]",
-                "<<<PROP_PROMPTS>>>",
-                "[追加到 assets/prop-prompts.md 的内容；**只有当导演分析的「道具清单」里全部是占位行 `(本集无新增叙事关键道具)` 时**才写：`(本集无新增道具)`。否则必须为每个道具产出提示词。]",
-                "",
+                f"任务: 为 {episode} 生成本集新增的服化道内容。",
+                "严格按以下格式输出，不要额外文字:",
+                "<<<CHARACTER_PROMPTS>>>\n[仅需要追加到 assets/character-prompts.md 的 markdown 内容，不要重复文件标题]",
+                "<<<SCENE_PROMPTS>>>\n[仅需要追加到 assets/scene-prompts.md 的 markdown 内容，不要重复文件标题]",
                 self._labeled_block("导演分析", self.project.read_text(director_output)),
-                self._optional_block("已有人物提示词", strip_frontmatter(self.project.read_text(self.project.character_prompts_path))),
-                self._optional_block("已有场景提示词", strip_frontmatter(self.project.read_text(self.project.scene_prompts_path))),
-                self._optional_block("已有道具提示词", strip_frontmatter(self.project.read_text(self.project.prop_prompts_path))),
+                self._optional_block("已有人物提示词", self.project.read_text(self.project.character_prompts_path)),
+                self._optional_block("已有场景提示词", self.project.read_text(self.project.scene_prompts_path)),
             ]
         )
         response = self._call_agent(
@@ -940,31 +676,23 @@ class StandaloneRunner:
         director_output: Path,
         character_content: str,
         scene_content: str,
-        prop_content: str,
         *,
         max_review_rounds: int,
-    ) -> tuple[str, str, str, list[ReviewResult]]:
-        """§38: 增 prop_content。返回 (char, scene, prop, reviews)。"""
+    ) -> tuple[str, str, list[ReviewResult]]:
         reviews: list[ReviewResult] = []
         current_character = character_content
         current_scene = scene_content
-        current_prop = prop_content
         for _ in range(max_review_rounds + 1):
-            business = self._review_art_business(
-                episode, director_output, current_character, current_scene, current_prop
-            )
-            compliance = self._review_art_compliance(
-                episode, current_character, current_scene, current_prop
-            )
+            business = self._review_art_business(episode, director_output, current_character, current_scene)
+            compliance = self._review_art_compliance(episode, current_character, current_scene)
             reviews = [business, compliance]
             if all(review.passed for review in reviews):
-                return current_character, current_scene, current_prop, reviews
-            current_character, current_scene, current_prop = self._revise_art_design(
+                return current_character, current_scene, reviews
+            current_character, current_scene = self._revise_art_design(
                 episode,
                 director_output,
                 current_character,
                 current_scene,
-                current_prop,
                 reviews,
             )
         raise RuntimeError("服化道设计在最大审核轮次后仍未通过。")
@@ -975,19 +703,16 @@ class StandaloneRunner:
         director_output: Path,
         character_content: str,
         scene_content: str,
-        prop_content: str = "",
     ) -> ReviewResult:
         prompt = "\n\n".join(
             [
                 f"现在执行 {episode} 的 art-direction-review-skill 业务审核。",
                 "你必须只输出审核结果。",
                 self._labeled_block("导演分析", self.project.read_text(director_output)),
-                self._optional_block("已有人物提示词", strip_frontmatter(self.project.read_text(self.project.character_prompts_path))),
-                self._optional_block("已有场景提示词", strip_frontmatter(self.project.read_text(self.project.scene_prompts_path))),
-                self._optional_block("已有道具提示词", strip_frontmatter(self.project.read_text(self.project.prop_prompts_path))),
+                self._optional_block("已有人物提示词", self.project.read_text(self.project.character_prompts_path)),
+                self._optional_block("已有场景提示词", self.project.read_text(self.project.scene_prompts_path)),
                 self._labeled_block("本集新增人物提示词", character_content),
                 self._labeled_block("本集新增场景提示词", scene_content),
-                self._optional_block("本集新增道具提示词", prop_content),
             ]
         )
         text = self._call_agent(
@@ -1006,7 +731,6 @@ class StandaloneRunner:
         episode: str,
         character_content: str,
         scene_content: str,
-        prop_content: str = "",
     ) -> ReviewResult:
         prompt = "\n\n".join(
             [
@@ -1014,7 +738,6 @@ class StandaloneRunner:
                 "你必须只输出审核结果。",
                 self._labeled_block("本集新增人物提示词", character_content),
                 self._labeled_block("本集新增场景提示词", scene_content),
-                self._optional_block("本集新增道具提示词", prop_content),
             ]
         )
         text = self._call_agent(
@@ -1034,10 +757,8 @@ class StandaloneRunner:
         director_output: Path,
         character_content: str,
         scene_content: str,
-        prop_content: str,
         reviews: Sequence[ReviewResult],
-    ) -> tuple[str, str, str]:
-        """§38: 增 prop 修订。"""
+    ) -> tuple[str, str]:
         feedback = "\n\n".join(f"[{review.name}]\n{review.text}" for review in reviews)
         prompt = "\n\n".join(
             [
@@ -1045,11 +766,9 @@ class StandaloneRunner:
                 "严格按以下格式输出，不要额外文字:",
                 "<<<CHARACTER_PROMPTS>>>\n[仅需要追加到 assets/character-prompts.md 的 markdown 内容，不要重复文件标题]",
                 "<<<SCENE_PROMPTS>>>\n[仅需要追加到 assets/scene-prompts.md 的 markdown 内容，不要重复文件标题]",
-                "<<<PROP_PROMPTS>>>\n[仅需要追加到 assets/prop-prompts.md 的 markdown 内容；若本集无新增道具，写：(本集无新增道具)]",
                 self._labeled_block("导演分析", self.project.read_text(director_output)),
                 self._labeled_block("当前人物提示词新增内容", character_content),
                 self._labeled_block("当前场景提示词新增内容", scene_content),
-                self._optional_block("当前道具提示词新增内容", prop_content),
                 self._labeled_block("审核意见", feedback),
             ]
         )
@@ -1069,16 +788,6 @@ class StandaloneRunner:
             [
                 f"任务: 为 {episode} 生成完整的 outputs/{episode}/02-seedance-prompts.md。",
                 "你必须只输出最终 markdown 文件内容，不要解释，不要加代码块。",
-                "",
-                '## 台词书写规则（§38.9 强制，与下游音色拼接配套）',
-                '每个剧情点 P0X 提示词里写台词时，**必须显式标注说话者姓名，禁止用代词**：',
-                '- ✗ 错：`她笑着说：「小林，你看！」`',
-                '- ✗ 错：`他对着镜头说：「...」`',
-                '- ✓ 对：`王阿姨笑着说：「小林，你看！」`',
-                '- ✓ 对：`林远对着镜头说：「...」`',
-                '**规则**：每一句带引号的台词前 20 字符内必须出现说话角色的姓名（不能用「他/她/它/他们/她们」等代词）。',
-                '**原因**：下游识别绑定智能推荐要按「角色名→引号」的相邻关系拼音色垫词，代词会让 TTS 把音色拼错。',
-                "",
                 self._labeled_block("导演分析", self.project.read_text(director_output)),
                 self._labeled_block("人物提示词", self.project.read_text(self.project.character_prompts_path)),
                 self._labeled_block("场景提示词", self.project.read_text(self.project.scene_prompts_path)),
@@ -1230,16 +939,13 @@ class StandaloneRunner:
                 parts.append(f"===== {relative} =====\n{path.read_text(encoding='utf-8')}")
         return "\n\n".join(parts)
 
-    def _parse_art_sections(self, response: str) -> tuple[str, str, str]:
-        """§38: 返回 (character, scene, prop) 三元组。prop 缺失返回空串。"""
+    def _parse_art_sections(self, response: str) -> tuple[str, str]:
         match = SECTION_PATTERN.search(response)
         if not match:
-            raise RuntimeError("服化道输出未按约定的多区块格式返回。")
+            raise RuntimeError("服化道输出未按约定的双区块格式返回。")
         character_content = self._normalize_asset_content(match.group(1), "人物提示词")
         scene_content = self._normalize_asset_content(match.group(2), "场景道具提示词")
-        prop_raw = match.group(3) or ""
-        prop_content = self._normalize_asset_content(prop_raw, "道具提示词") if prop_raw.strip() else ""
-        return character_content, scene_content, prop_content
+        return character_content, scene_content
 
     def _normalize_asset_content(self, content: str, header: str) -> str:
         normalized = content.strip()
@@ -1254,35 +960,19 @@ class StandaloneRunner:
         content: str,
         *,
         replace_episode: str | None,
-        stage: str = "",         # §38: 新增 frontmatter 元数据
-        episode: str = "",
-        skill_hash: str = "",
     ) -> None:
         content = content.strip()
         if not content:
             return
-        existing_raw = self.project.read_text(path)
-        # §38: 剥离老 frontmatter 再合并，新 frontmatter 始终在顶部
-        existing = strip_frontmatter(existing_raw)
+        existing = self.project.read_text(path)
         if replace_episode:
             existing = self._remove_episode_sections(existing, replace_episode)
 
         if not existing.strip():
-            body = f"# {title}\n\n---\n\n{content}\n"
+            merged = f"# {title}\n\n---\n\n{content}\n"
         else:
-            body = existing.rstrip() + "\n\n---\n\n" + content + "\n"
-
-        # §38: 加 frontmatter 头
-        if stage and episode:
-            schema_v = SCHEMA_VERSIONS.get(stage, 1)
-            fm = render_frontmatter(
-                schema_version=schema_v,
-                skill_hash=skill_hash,
-                stage=stage,
-                episode=episode,
-            )
-            body = fm + body
-        self.project.write_text(path, body)
+            merged = existing.rstrip() + "\n\n---\n\n" + content + "\n"
+        self.project.write_text(path, merged)
 
     def _remove_episode_sections(self, content: str, episode: str) -> str:
         if not content.strip():
@@ -1311,63 +1001,6 @@ class StandaloneRunner:
         if not cleaned:
             return f"<<<{label}>>>\n(无)\n<<<END_{label}>>>"
         return self._labeled_block(label, cleaned)
-
-    def _smart_analyze_digest(self) -> str:
-        """§39: 读 assets/smart_analyze_result.json,格式化成精简可读文本供 director 参考。
-        文件由 PHP 侧 ai_series_ocf_run_smart_analyze_prestep 落地;不存在则返回空串。"""
-        path = self.project.assets_dir / "smart_analyze_result.json"
-        if not path.exists():
-            return ""
-        try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-        except Exception:
-            return ""
-        if not isinstance(data, dict):
-            return ""
-        lines: list[str] = []
-        summary = data.get("summary") or {}
-        if isinstance(summary, dict):
-            lines.append(
-                f"概览: 场景 {summary.get('scene_count', '?')} / "
-                f"人物 {summary.get('character_count', '?')} / "
-                f"分镜 {summary.get('shot_count', '?')}"
-            )
-        chars = data.get("characters") or []
-        if isinstance(chars, list) and chars:
-            lines.append("\n[人物]")
-            for c in chars:
-                if not isinstance(c, dict):
-                    continue
-                lines.append(
-                    f"- {c.get('name', '')}"
-                    f"（{c.get('role', '')}）: {c.get('appearance', '')}".rstrip("（）: ")
-                )
-        scenes = data.get("scenes") or []
-        if isinstance(scenes, list) and scenes:
-            lines.append("\n[场景]")
-            for s in scenes:
-                if not isinstance(s, dict):
-                    continue
-                lines.append(
-                    f"- {s.get('scene_id', '')} {s.get('name', '')}"
-                    f" | {s.get('location', '')} | {s.get('time', '')} | {s.get('atmosphere', '')}"
-                )
-        shots = data.get("shots") or []
-        if isinstance(shots, list) and shots:
-            lines.append("\n[分镜]")
-            for sh in shots:
-                if not isinstance(sh, dict):
-                    continue
-                chs = sh.get("characters") or []
-                ch_str = "、".join(chs) if isinstance(chs, list) else ""
-                lines.append(
-                    f"- 镜{sh.get('shot_no', '')} [{sh.get('scene_id', '')}] "
-                    f"{sh.get('shot_size', '')}/{sh.get('camera', '')}/{sh.get('duration_s', '')}s "
-                    f"| {sh.get('description', '')}"
-                    + (f" | 角色:{ch_str}" if ch_str else "")
-                    + (f" | 台词:{sh.get('dialogue', '')}" if sh.get("dialogue") else "")
-                )
-        return "\n".join(lines).strip()
 
     def _ask_or_require(self, label: str, hint: str) -> str:
         if sys.stdin.isatty():
@@ -1413,13 +1046,6 @@ def build_parser() -> argparse.ArgumentParser:
         prog="seedance.py",
         description="Standalone runner for the Seedance storyboard workflow.",
     )
-    # 2026-05-10 §22: 支持 --project-dir 显式指定工作目录（OCF 多项目隔离）
-    # 默认仍为脚本所在目录（保持 CLI 老用法兼容）
-    parser.add_argument(
-        "--project-dir",
-        help="Project working directory (default: directory of this script). "
-             "Used by AI漫控台 OCF for per-project isolation: /var/lib/ai_series_ocf/<project>/<ep>/",
-    )
     subparsers = parser.add_subparsers(dest="command", required=True)
     subparsers.add_parser("status", help="Show project progress.")
 
@@ -1460,13 +1086,7 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
-    # 2026-05-10 §22: --project-dir 优先；缺省退回脚本所在目录（兼容老用法）
-    project_root = (
-        Path(args.project_dir).resolve()
-        if getattr(args, "project_dir", None)
-        else Path(__file__).resolve().parent
-    )
-    project = SeedanceProject(project_root)
+    project = SeedanceProject(Path(__file__).resolve().parent)
 
     if args.command == "status":
         return print_status(project)

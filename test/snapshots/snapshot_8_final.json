@@ -1,0 +1,83 @@
+{
+    "name": "snapshot_8_final",
+    "timestamp": "2026-05-24T10:43:23+00:00",
+    "project": {
+        "project_ref": 16,
+        "timestamp": "2026-05-24T10:43:23+00:00",
+        "tree_by_type": {
+            "project": 1,
+            "scripts": 1,
+            "assets": 1,
+            "chars": 1,
+            "scenes": 1,
+            "props": 1,
+            "voices": 1,
+            "prompts": 1,
+            "custom_asset": 2,
+            "episode": 1,
+            "boards": 1
+        },
+        "project_asset_by_type": {
+            "type2_archive3": 25,
+            "type16_archive3": 54,
+            "type18_archive3": 16,
+            "type15_archive3": 24,
+            "type16_archive0": 1
+        },
+        "episodes": [
+            {
+                "ref": 15,
+                "ep_num": "1",
+                "title": "第1集"
+            }
+        ],
+        "collection_map": {
+            "project": 10777,
+            "script_library": 10778,
+            "asset_library": 10779,
+            "character_library": 10780,
+            "scene_library": 10781,
+            "prop_library": 10782,
+            "voice_library": 10783,
+            "prompt_library": 10784
+        },
+        "pt_cards": [
+            {
+                "ref": 103959,
+                "title": "人物提示词库",
+                "has_image": 1
+            },
+            {
+                "ref": 103960,
+                "title": "场景提示词库",
+                "has_image": 1
+            },
+            {
+                "ref": 103961,
+                "title": "视频提示词库",
+                "has_image": 1
+            },
+            {
+                "ref": 103962,
+                "title": "剧本提示词库",
+                "has_image": 1
+            },
+            {
+                "ref": 103963,
+                "title": "道具提示词库",
+                "has_image": 1
+            },
+            {
+                "ref": 103964,
+                "title": "音色提示词库",
+                "has_image": 1
+            }
+        ]
+    },
+    "system_audit": {
+        "cross_tenant_orphan_collections": 0,
+        "archive3_leak_links": 0,
+        "tree_dead_refs": 0,
+        "project_asset_dead_refs": 0
+    }
+}
